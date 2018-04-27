@@ -414,6 +414,12 @@ pub struct ProtectionSchemeInfoBox {
     pub tenc: Option<TrackEncryptionBox>,
 }
 
+#[derive(Debug, Default)]
+pub struct CustomBox {
+    pub name: FourCC,
+    pub contents: Vec<u8>,
+}
+
 /// Internal data structures.
 #[derive(Debug, Default)]
 pub struct MediaContext {
@@ -421,7 +427,8 @@ pub struct MediaContext {
     /// Tracks found in the file.
     pub tracks: Vec<Track>,
     pub mvex: Option<MovieExtendsBox>,
-    pub psshs: Vec<ProtectionSystemSpecificHeaderBox>
+    pub psshs: Vec<ProtectionSystemSpecificHeaderBox>,
+    pub custom_boxes: Vec<CustomBox>
 }
 
 impl MediaContext {
@@ -682,6 +689,20 @@ pub fn read_mp4<T: Read>(f: &mut T, context: &mut MediaContext) -> Result<()> {
             BoxType::MovieBox => {
                 read_moov(&mut b, context)?;
                 found_moov = true;
+            }
+            BoxType::UnknownBox(name) => {
+                let size = {
+                    let header = b.get_header();
+                    (header.size - header.offset) as usize
+                };
+
+                assert_eq!(size, b.bytes_left());
+                let contents = read_buf(&mut b, size)?;
+
+                vec_push(&mut context.custom_boxes, CustomBox {
+                    name: FourCC::from(name),
+                    contents,
+                })?;
             }
             _ => skip_box_content(&mut b)?,
         };
