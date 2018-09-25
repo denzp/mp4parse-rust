@@ -420,6 +420,52 @@ pub struct CustomBox {
     pub contents: Vec<u8>,
 }
 
+#[derive(Debug, Default)]
+pub struct MovieFragment {
+    pub sequence_number: Option<u32>,
+    pub psshs: Vec<ProtectionSystemSpecificHeaderBox>,
+    pub tracks: Vec<TrackFragment>,
+}
+
+#[derive(Debug, Default)]
+pub struct TrackFragment {
+    pub track_id: Option<u32>,
+    pub base_data_offset: Option<u64>,
+    pub default_sample_description_index: Option<u32>,
+    pub default_sample_duration: Option<u32>,
+    pub default_sample_size: Option<u32>,
+    pub default_sample_flags: Option<u32>,
+
+    pub trun: Option<TrackFragmentRunBox>,
+    pub senc: Option<SampleEncryptionBox>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TrackFragmentRunBox {
+    pub sample_count: u32,
+    pub data_offset: Option<i32>,
+    pub data_offset_global: Option<u64>,
+    pub first_sample_flags: Option<u32>,
+    pub sample_sizes: Vec<u32>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SampleEncryptionBox {
+    pub samples: Vec<SampleEncryption>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SampleEncryption {
+    pub iv: Vec<u8>,
+    pub subsamples: Vec<SubSampleEncryption>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SubSampleEncryption {
+    pub bytes_of_clear_data: u16,
+    pub bytes_of_encrypted_data: u32,
+}
+
 /// Internal data structures.
 #[derive(Debug, Default)]
 pub struct MediaContext {
@@ -428,7 +474,8 @@ pub struct MediaContext {
     pub tracks: Vec<Track>,
     pub mvex: Option<MovieExtendsBox>,
     pub psshs: Vec<ProtectionSystemSpecificHeaderBox>,
-    pub custom_boxes: Vec<CustomBox>
+    pub custom_boxes: Vec<CustomBox>,
+    pub fragments: Vec<MovieFragment>,
 }
 
 impl MediaContext {
@@ -660,7 +707,8 @@ macro_rules! check_parser_state {
 /// which can be examined later.
 pub fn read_mp4<T: Read>(f: &mut T, context: &mut MediaContext) -> Result<()> {
     let mut found_ftyp = false;
-    let mut found_moov = false;
+    let mut found_moov_or_moof = false;
+    let mut global_offset = 0;
     // TODO(kinetik): Top-level parsing should handle zero-sized boxes
     // rather than throwing an error.
     let mut iter = BoxIter::new(f);
@@ -688,7 +736,11 @@ pub fn read_mp4<T: Read>(f: &mut T, context: &mut MediaContext) -> Result<()> {
             }
             BoxType::MovieBox => {
                 read_moov(&mut b, context)?;
-                found_moov = true;
+                found_moov_or_moof = true;
+            }
+            BoxType::MovieFragmentBox => {
+                read_moof(&mut b, context, global_offset)?;
+                found_moov_or_moof = true;
             }
             BoxType::UnknownBox(name) => {
                 let size = {
@@ -706,8 +758,11 @@ pub fn read_mp4<T: Read>(f: &mut T, context: &mut MediaContext) -> Result<()> {
             }
             _ => skip_box_content(&mut b)?,
         };
+
         check_parser_state!(b.content);
-        if found_moov {
+        global_offset += b.head.size;
+
+        if found_moov_or_moof {
             debug!("found moov {}, could stop pure 'moov' parser now", if found_ftyp {
                 "and ftyp"
             } else {
@@ -719,7 +774,7 @@ pub fn read_mp4<T: Read>(f: &mut T, context: &mut MediaContext) -> Result<()> {
     // XXX(kinetik): This isn't perfect, as a "moov" with no contents is
     // treated as okay but we haven't found anything useful.  Needs more
     // thought for clearer behaviour here.
-    if found_moov {
+    if found_moov_or_moof {
         Ok(())
     } else {
         Err(Error::NoMoov)
@@ -763,6 +818,35 @@ fn read_moov<T: Read>(f: &mut BMFFBox<T>, context: &mut MediaContext) -> Result<
         };
         check_parser_state!(b.content);
     }
+    Ok(())
+}
+
+fn read_moof<T: Read>(f: &mut BMFFBox<T>, context: &mut MediaContext, global_offset: u64) -> Result<()> {
+    let mut fragment = MovieFragment {
+        sequence_number: None,
+        psshs: vec![],
+        tracks: vec![],
+    };
+
+    let mut iter = f.box_iter();
+    while let Some(mut b) = iter.next_box()? {
+        match b.head.name {
+            BoxType::MovieFragmentHeaderBox => {
+                read_mfhd(&mut b, &mut fragment)?;
+            }
+            BoxType::TrackFragmentBox => {
+                vec_push(&mut fragment.tracks, read_traf(&mut b, global_offset)?)?;
+            }
+            BoxType::ProtectionSystemSpecificHeaderBox => {
+                vec_push(&mut fragment.psshs, read_pssh(&mut b)?)?;
+            }
+
+            _ => skip_box_content(&mut b)?,
+        };
+        check_parser_state!(b.content);
+    }
+
+    vec_push(&mut context.fragments, fragment)?;
     Ok(())
 }
 
@@ -847,6 +931,165 @@ fn read_trak<T: Read>(f: &mut BMFFBox<T>, track: &mut Track) -> Result<()> {
         };
         check_parser_state!(b.content);
     }
+    Ok(())
+}
+
+
+fn read_mfhd<T: Read>(src: &mut BMFFBox<T>, fragment: &mut MovieFragment) -> Result<()> {
+    read_fullbox_extra(src)?;
+    fragment.sequence_number = Some(be_u32(src)?);
+
+    Ok(())
+}
+
+fn read_traf<T: Read>(src: &mut BMFFBox<T>, moof_global_offset: u64) -> Result<TrackFragment> {
+    let mut track = TrackFragment {
+        track_id: None,
+        base_data_offset: None,
+        default_sample_description_index: None,
+        default_sample_duration: None,
+        default_sample_size: None,
+        default_sample_flags: None,
+
+        senc: None,
+        trun: None,
+    };
+
+    let mut iter = src.box_iter();
+    while let Some(mut b) = iter.next_box()? {
+        match b.head.name {
+            BoxType::TrackFragmentHeaderBox => {
+                read_tfhd(&mut b, &mut track)?;
+            },
+            BoxType::TrackFragmentRunBox => {
+                read_trun(&mut b, &mut track, moof_global_offset)?;
+            },
+            BoxType::SampleEncodingBox => {
+                read_senc(&mut b, &mut track)?;
+            },
+
+            _ => skip_box_content(&mut b)?,
+        }
+    }
+
+    Ok(track)
+}
+
+fn read_tfhd<T: Read>(src: &mut BMFFBox<T>, track: &mut TrackFragment) -> Result<()> {
+    let (_, flags) = read_fullbox_extra(src)?;
+
+    track.track_id = Some(be_u32(src)?);
+
+    if flags & 0x01 > 0 {
+        track.base_data_offset = Some(be_u64(src)?);
+    }
+
+    if flags & 0x02 > 0 {
+        track.default_sample_description_index = Some(be_u32(src)?);
+    }
+
+    if flags & 0x08 > 0 {
+        track.default_sample_duration = Some(be_u32(src)?);
+    }
+
+    if flags & 0x10 > 0 {
+        track.default_sample_size = Some(be_u32(src)?);
+    }
+
+    if flags & 0x20 > 0 {
+        track.default_sample_flags = Some(be_u32(src)?);
+    }
+
+    Ok(())
+}
+
+fn read_senc<T: Read>(src: &mut BMFFBox<T>, track: &mut TrackFragment) -> Result<()> {
+    let (_, flags) = read_fullbox_extra(src)?;
+    let mut contents = SampleEncryptionBox {
+        samples: vec![],
+    };
+
+    let sample_count = be_u32(src)?;
+    vec_reserve(&mut contents.samples, sample_count as usize)?;
+
+    for _ in 0..sample_count {
+        let mut sample = SampleEncryption {
+            iv: vec![0; 8],
+            subsamples: vec![],
+        };
+
+        src.read_exact(sample.iv.as_mut_slice())?;
+
+        if flags & 0x02 > 0 {
+            let subsample_count = be_u16(src)?;
+
+            for _ in 0..subsample_count {
+                let bytes_of_clear_data = be_u16(src)?;
+                let bytes_of_encrypted_data = be_u32(src)?;
+
+                vec_push(&mut sample.subsamples, SubSampleEncryption {
+                    bytes_of_clear_data,
+                    bytes_of_encrypted_data
+                })?;
+            }
+        }
+
+        vec_push(&mut contents.samples, sample)?;
+    }
+
+    track.senc = Some(contents);
+    Ok(())
+}
+
+fn read_trun<T: Read>(src: &mut BMFFBox<T>, track: &mut TrackFragment, moof_global_offset: u64) -> Result<()> {
+    let (_, flags) = read_fullbox_extra(src)?;
+
+    let sample_count = be_u32(src)?;
+    let mut contents = TrackFragmentRunBox {
+        sample_count,
+
+        data_offset: None,
+        data_offset_global: None,
+
+        first_sample_flags: None,
+        sample_sizes: vec![],
+    };
+
+    if flags & 0x0001 > 0 {
+        let offset = be_i32(src)?;
+        contents.data_offset = Some(offset);
+
+        if offset > 0 {
+            contents.data_offset_global = Some(moof_global_offset + offset as u64);
+        } else {
+            contents.data_offset_global = Some(moof_global_offset - i32::abs(offset) as u64);
+        }
+    }
+
+    if flags & 0x0004 > 0 {
+        contents.first_sample_flags = Some(be_u32(src)?);
+    }
+
+    if flags & 0x0200 > 0 {
+        vec_reserve(&mut contents.sample_sizes, sample_count as usize)?;
+
+        for _ in 0..sample_count {
+            if flags & 0x0100 > 0 {
+                skip(src, 4)?; // sample_duration
+            }
+
+            vec_push(&mut contents.sample_sizes, be_u32(src)?)?;
+
+            if flags & 0x0400 > 0 {
+                skip(src, 4)?; // sample_flags
+            }
+            if flags & 0x0800 > 0 {
+                skip(src, 4)?; // sample_composition_time_offset
+            }
+        }
+    }
+
+    track.trun = Some(contents);
     Ok(())
 }
 

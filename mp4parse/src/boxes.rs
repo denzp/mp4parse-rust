@@ -140,4 +140,12 @@ box_database!(
     LPCMAudioSampleEntry              0x6C70636D, // "lpcm" - quicktime atom
     ALACSpecificBox                   0x616C6163, // "alac" - Also used by ALACSampleEntry
     MovieData                         0x6d646174, // "mdat"
+    SegmentIndex                      0x73696478, // "sidx"
+    SegmentTypeBox                    0x73747970, // "styp"
+    MovieFragmentBox                  0x6d6f6f66, // "moof"
+    MovieFragmentHeaderBox            0x6d666864, // "mfhd"
+    TrackFragmentBox                  0x74726166, // "traf"
+    TrackFragmentHeaderBox            0x74666864, // "tfhd"
+    TrackFragmentRunBox               0x7472756e, // "trun"
+    SampleEncodingBox                 0x73656e63, // "senc"
 );
